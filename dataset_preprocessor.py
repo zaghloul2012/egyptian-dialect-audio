@@ -110,54 +110,76 @@ def preprocess_audio_dataset(
             
             return {
                 'audio': audio_array,
-                'target_label': label2id[example['label']]  # Use different name to avoid conflicts
+                'labels': label2id[example['label']]  # Use different name to avoid conflicts
             }
         except Exception as e:
             print(f"Error processing audio: {e}")
             # Return empty audio array if processing fails
             return {
                 'audio': np.zeros(int(sampling_rate * 0.1), dtype=np.float32),
-                'target_label': label2id[example['label']]
+                'labels': label2id[example['label']]
             }
     
     def preprocess_function_whisper(examples):
-        """Feature extraction for Whisper models"""
+        """Feature extraction and padding for Whisper models"""
         try:
             audio_arrays = [audio for audio in examples["audio"]]
-            
-            # Filter and pad short audio
             processed_audio = []
+
+            # Whisper expects 30 seconds of audio at 16kHz
+            target_length = int(sampling_rate * 30)  # 30 seconds = 480,000 samples at 16kHz
+
             for audio in audio_arrays:
-                if len(audio) < int(sampling_rate * 0.1):
-                    min_length = int(sampling_rate * 0.1)
-                    audio = np.pad(audio, (0, min_length - len(audio)), mode='constant')
+                # Ensure audio is float32 and 1D
+                audio = np.array(audio, dtype=np.float32)
+                if audio.ndim > 1:
+                    audio = audio.flatten()
+                
+                # Pad or truncate to exactly 30 seconds
+                if len(audio) < target_length:
+                    # Pad with zeros to reach 30 seconds
+                    audio = np.pad(audio, (0, target_length - len(audio)), mode='constant', constant_values=0)
+                elif len(audio) > target_length:
+                    # Truncate to 30 seconds
+                    audio = audio[:target_length]
+                
                 processed_audio.append(audio)
-            
-            # Whisper feature extraction
+
+            # Extract mel-spectrogram features
+            # Whisper's feature extractor will convert 30s audio (480,000 samples) to 3000 mel frames
             features = feature_extractor(
                 processed_audio,
                 sampling_rate=sampling_rate,
-                max_length=int(sampling_rate * max_duration),
-                truncation=True,
-                padding="max_length",
-                return_attention_mask=False,
-                return_tensors="np"
+                return_tensors="np",
+                padding=False,  # We already padded the raw audio
+                truncation=False,  # We already truncated the raw audio
+                return_attention_mask=False
             )
+
+            # Verify the output shape
+            input_features = features["input_features"]
+            expected_shape = (len(processed_audio), 80, 3000)  # (batch_size, n_mels, n_frames)
             
+            if input_features.shape != expected_shape:
+                print(f"⚠️  Warning: Expected shape {expected_shape}, got {input_features.shape}")
+                # If shape is wrong, create properly shaped features
+                input_features = np.zeros(expected_shape, dtype=np.float32)
+
             return {
-                "input_features": features["input_features"],
-                "label": examples["target_label"]
+                "input_features": input_features,
+                "label": examples["labels"]
             }
-            
+
         except Exception as e:
-            print(f"Error in Whisper feature extraction: {e}")
+            print(f"❌ Error in Whisper feature extraction: {e}")
             batch_size = len(examples["audio"])
-            # Whisper mel-spectrogram features (80 mel bins)
-            dummy_features = np.zeros((batch_size, 80, 3000))
+            # Return properly shaped dummy features as fallback
+            dummy_features = np.zeros((batch_size, 80, 3000), dtype=np.float32)
             return {
                 "input_features": dummy_features,
-                "label": examples["target_label"]
+                "label": examples["labels"]
             }
+
     
     def preprocess_function_wav2vec(examples):
         """Feature extraction for Wav2Vec2/HuBERT models"""
@@ -186,7 +208,7 @@ def preprocess_audio_dataset(
             
             return {
                 "input_values": features["input_values"],
-                "label": examples["target_label"]
+                "label": examples["labels"]
             }
             
         except Exception as e:
@@ -196,7 +218,7 @@ def preprocess_audio_dataset(
             dummy_features = np.zeros((batch_size, max_length))
             return {
                 "input_values": dummy_features,
-                "label": examples["target_label"]
+                "label": examples["labels"]
             }
     
     # Select the appropriate preprocessing function
@@ -222,7 +244,7 @@ def preprocess_audio_dataset(
         
         # Remove unnecessary columns
         columns_to_remove = [col for col in split_data.column_names 
-                           if col not in ['audio', 'target_label']]
+                           if col not in ['audio', 'labels']]
         if remove_columns:
             columns_to_remove.extend(remove_columns)
         
